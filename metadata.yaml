@@ -10,7 +10,7 @@ help: >-
   2. AI 调用 forward_images 提取转发合并转发内图片、跨会话图、QQ头像或外链图；
   3. AI 调用 draw_image 进行文生图、任意来源多图融合改图、生成原生 GIF 动图；
   4. 指令：/img_pool 查看当前会话图片池，/img_clear 清空当前会话图片池。
-version: "1.2.0"
+version: "1.3.0"
 author: "zjj1280637679-ship-it"
 repo: "https://github.com/zjj1280637679-ship-it/astrbot_plugin_minimal_draw"
 social_link: https://github.com/zjj1280637679-ship-it

@@ -24,9 +24,7 @@ from PIL import Image as PILImage
 import astrbot.api.message_components as Comp
 from astrbot.api import AstrBotConfig, logger, star
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import StarTools
-from astrbot.core.agent.message import TextPart
 from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
 from astrbot.core.utils.quoted_message.chain_parser import (
@@ -102,8 +100,6 @@ class MinimalVisionDrawPlugin(star.Star):
         self._global_images: deque[RecentImageItem] = deque(maxlen=60)
         # 每个会话自增的图片序号计数
         self._session_counter: dict[str, int] = defaultdict(int)
-        # 记录用户在会话中最近一次纯文本发言: (umo, sender_id) -> (timestamp, text)
-        self._recent_sender_text: dict[tuple[str, str], tuple[float, str]] = {}
         # 记录非管理员用户上次生图时间戳: sender_id -> timestamp
         self._user_last_draw_ts: dict[str, float] = {}
 
@@ -201,13 +197,13 @@ class MinimalVisionDrawPlugin(star.Star):
 
     def _gif_frame_count(self) -> int:
         try:
-            return max(2, min(24, int(self.config.get("gif_frame_count", 9))))
+            return max(2, min(16, int(self.config.get("gif_frame_count", 9))))
         except (TypeError, ValueError):
             return 9
 
     def _gif_frame_duration_ms(self) -> int:
         try:
-            return max(40, min(2000, int(self.config.get("gif_frame_duration_ms", 180))))
+            return max(20, min(2000, int(self.config.get("gif_frame_duration_ms", 180))))
         except (TypeError, ValueError):
             return 180
 
@@ -319,24 +315,6 @@ class MinimalVisionDrawPlugin(star.Star):
         cfg = self.context.get_config(umo=event.unified_msg_origin) or {}
         global_admins = {str(x).strip() for x in (cfg.get("admins_id") or [])}
         return sender_id in global_admins
-
-    @filter.on_llm_request()
-    async def inject_draw_permission_context(
-        self,
-        event: AstrMessageEvent,
-        req: ProviderRequest,
-    ) -> None:
-        """在 LLM 请求末尾（extra_user_content_parts）注入管理员身份，严禁修改顶部 system_prompt 以保护 OpenAI 前缀缓存命中率"""
-        if self._is_sender_admin(event):
-            notice = TextPart(
-                text=(
-                    "<system_reminder>"
-                    "当前发言用户是机器人最高管理员，已解锁高级/高精度生图模型权限。"
-                    "调用 draw_image 时，是否开启 high_precision=true 由你结合对话上下文自由判断。"
-                    "</system_reminder>"
-                )
-            ).mark_as_temp()
-            req.extra_user_content_parts.append(notice)
 
     def _resolve_model_and_quality(
         self,
@@ -621,13 +599,8 @@ class MinimalVisionDrawPlugin(star.Star):
 
     @filter.event_message_type(filter.EventMessageType.ALL, priority=999)
     async def passive_image_sniffer(self, event: AstrMessageEvent) -> None:
-        """全量静默旁路监听：0 Token 消耗记录近期图片（含普通图、原图文件、合并转发内图片、分享图）与前后紧邻配文"""
+        """全量静默旁路监听：0 Token 消耗记录近期图片（含普通图、原图文件、合并转发内图片、分享图）与附带配文"""
         try:
-            umo = event.unified_msg_origin
-            sender_id = str(event.get_sender_id() or "")
-            sender_name = str(event.get_sender_name() or sender_id or "用户")
-            now = time.time()
-
             messages = event.get_messages()
             if not messages:
                 return
@@ -654,12 +627,14 @@ class MinimalVisionDrawPlugin(star.Star):
                 elif isinstance(comp, (Comp.Forward, Comp.Node, Comp.Nodes, Comp.Json)):
                     has_forward = True
 
-            msg_text = " ".join(text_parts).strip()
-            bound_text = msg_text
-            if not bound_text and (image_comps or file_image_comps or has_forward):
-                prev = self._recent_sender_text.get((umo, sender_id))
-                if prev and (now - prev[0]) <= 20:
-                    bound_text = f"(前序附言) {prev[1]}"
+            # 若消息中没有任何图像相关内容，直接跳过，绝不干扰纯文本对话
+            if not (image_comps or file_image_comps or share_urls or has_forward):
+                return
+
+            umo = event.unified_msg_origin
+            sender_id = str(event.get_sender_id() or "")
+            sender_name = str(event.get_sender_name() or sender_id or "用户")
+            bound_text = " ".join(text_parts).strip()
 
             # 1. 普通图片组件
             for comp in image_comps:
@@ -735,22 +710,6 @@ class MinimalVisionDrawPlugin(star.Star):
                         context_text=note,
                         is_bot_generated=False,
                     )
-
-            # 5. 纯文本消息：记录并回填 20s 内的先图后文
-            if msg_text and not (image_comps or file_image_comps or has_forward):
-                self._recent_sender_text[(umo, sender_id)] = (now, msg_text[:120])
-                q = self._session_images.get(umo)
-                if q:
-                    for item in reversed(q):
-                        if (
-                            not item.is_bot_generated
-                            and item.sender_id == sender_id
-                            and (now - item.created_at) <= 20
-                            and not item.context_text
-                        ):
-                            item.context_text = f"(后补附言) {msg_text[:120]}"
-                            self._save_cache_index()
-                            break
         except Exception as e:
             self._log.debug(f"passive_image_sniffer error: {e}")
 
@@ -885,11 +844,15 @@ class MinimalVisionDrawPlugin(star.Star):
         event: AstrMessageEvent,
         count: int = 5,
     ) -> mcp.types.CallToolResult | str:
-        """查看当前会话近期发送或生成的图片（含普通图、原图文件、合并转发内拆出的图片；返回每张图的真实画面、编号 IMG_n、发送者、时间、上下文配文及路径）。
-        当对话涉及上文或近期群聊中的图片、需要同时观察或对比多张近期图片、或者在图生图/图片转发前需要查看并挑选近期图片素材时，请积极适时地调用此工具来获取多图视觉视野。
+        """【工具是什么】：会话近期图片视野调取工具。
+        【功能】：调取当前会话及关联会话近期缓存的历史图片数据与缩略图（含直发图片、原图文件、合并转发内图片）。
+        【返回状态】：每张图片的真实画面缩略图、图片编号（#IMG_n）、发送者、相对时间、关联配文及本地文件路径。
+        【最小例子】：
+        - view_recent_images()：调取最近 5 张图片信息与缩略图
+        - view_recent_images(count=10)：调取最近 10 张图片
 
         Args:
-            count(number): 要查看的近期图片数量 N，默认值为 5（不填则默认查看最近 5 张，可根据需求在 1 到 20 之间动态调整）
+            count(number): 调取近期图片数量 N，默认 5（理论支持 1~20 范围自由调整）
         """
         umo = event.unified_msg_origin
         try:
@@ -918,20 +881,14 @@ class MinimalVisionDrawPlugin(star.Star):
             ]
             if user_global:
                 recent_items = user_global[-n:]
-                cross_notice = "（注：当前会话暂无图片，已自动为你调取该用户在其他会话/私聊中最近发送的图片）"
+                cross_notice = "（注：当前会话暂无图片，已自动调取该用户在其他会话中最近发送的图片）"
             else:
-                return "当前会话近期还没有缓存到任何历史图片。如果用户要看图或改图，请提醒用户发送图片、合并转发记录或图片链接。"
+                return "当前会话暂无缓存的历史图片。"
 
         contents: list[mcp.types.TextContent | mcp.types.ImageContent] = [
             mcp.types.TextContent(
                 type="text",
-                text=(
-                    f"已为你调取最近的 {len(recent_items)} 张图片视野（按时间从早到晚排列）{cross_notice}。\n"
-                    "【工具联动指南】：\n"
-                    "1. 若仅需回答画面内容，直接文字回复即可，请勿调用 send_message_to_user 重复刷屏发图；\n"
-                    "2. 若需基于其中单张或多张图进行【图生图 / 改图 / 多图融合 / 转GIF动图】，请调用 `draw_image` 并在 `image_source` 中填入编号（如 `IMG_1` 或多图 `IMG_1,IMG_2`）；\n"
-                    "3. 若用户要求【把某张或多张图直接发出来 / 提取转发 / 打包合并转发】，请调用 `forward_images` 工具并填入对应 `image_source`。"
-                ),
+                text=f"当前会话最近 {len(recent_items)} 张图片记录（时间正序）{cross_notice}：",
             )
         ]
 
@@ -1283,21 +1240,24 @@ class MinimalVisionDrawPlugin(star.Star):
         caption: str = "",
         target: str = "",
     ) -> str:
-        """提取并转发任意来源的一张或多张图片到当前聊天或指定会话（原图发送或打包为 QQ 合并转发聊天记录卡片，不消耗生图费用）。
-        适用场景：用户要求把近期某张/多张图片重发出来、把合并转发记录里的图片单独提取出来、把私聊发过的图转发到群里、把群友/自己的高清头像或群头像发出来、或把某个网络图片链接抓取发到群里。
+        """【工具是什么】：任意来源图片提取与转发工具。
+        【功能】：提取单张或多张图片并发送至目标会话，支持逐张原图直发或打包为合并转发卡片（不消耗生图配额）。
+        【返回状态】：已投递的目标会话、采用的发送形式（直接发图 / 合并转发卡片）、发送图片数量及对应的缓存编号列表。
+        【最小例子】：
+        - forward_images() 或 forward_images(image_source="latest")：重发最近一张图片到当前会话
+        - forward_images(image_source="IMG_1,IMG_2", forward_mode="merged")：打包指定编号图片为合并转发卡片发送
+        - forward_images(image_source="forward")：提取合并转发记录内的全部图片发送
+        - forward_images(image_source="self_avatar", target="private")：提取发送者头像私聊发送
 
         Args:
-            image_source(string): 图片来源（支持逗号分隔多图组合）。可填："IMG_1"、"IMG_1,IMG_2"、"1-4"（区间）、"latest"（最近一张）、"last:5"（最近5张）、"forward"（提取合并转发记录内的所有图片）、"quoted"（提取引用消息图片）、"my_latest"（跨会话提取该用户最近发的图，如私聊发过的图）、"self_avatar"（发送者头像）、"at_avatar"（被@群友头像）、"avatar:QQ号"、"group_avatar"（群头像）或任意图片 URL/本地路径
-            forward_mode(string): 发送形式。默认 "auto"（1~3张直接发图，超过3张自动打包为合并转发卡片）；可强制填 "direct"（逐张直接发送原图）或 "merged"（使用 QQ 合并转发卡片打包发送）
-            caption(string): 可选配文说明（随图片或合并转发卡片一起附带的简短文字）
-            target(string): 可选投递目标。留空("")默认发到当前会话；填 "private" 私聊发给当前提问者本人；管理员可填 "group:群号" 或 "private:QQ号" 跨会话定向转发
+            image_source(string): 图片来源（支持逗号或加号组合多图）。可填："IMG_1"、"IMG_1,IMG_2"、"1-4"、"latest"、"last:5"、"forward"（合并转发图）、"quoted"（引用图）、"my_latest"（用户跨会话图）、"self_avatar"（自己头像）、"at_avatar"（@群友头像）、"avatar:QQ号"、"group_avatar"（群头像）或任意图片 URL/本地路径
+            forward_mode(string): 发送形式。默认 "auto"（1~3张直接发图，超过3张合并转发）；也可填 "direct"（原图直发）或 "merged"（合并转发卡片）
+            caption(string): 随图附带的文本配文
+            target(string): 投递目标。默认留空("")发到当前会话；可填 "private" 私聊发给发送者本人；管理员可填 "group:群号" 或 "private:QQ号" 跨会话转发
         """
         paths = await self._resolve_image_sources(event, image_source)
         if not paths:
-            return (
-                f"未能从指定来源 ({image_source!r}) 找到任何有效图片。"
-                "请确认图片编号、合并转发记录或链接是否有效。"
-            )
+            return f"未找到指定来源 ({image_source!r}) 的有效图片。"
 
         umo = event.unified_msg_origin
         is_adm = self._is_sender_admin(event)
@@ -1411,9 +1371,7 @@ class MinimalVisionDrawPlugin(star.Star):
 
             mode_label = "合并转发卡片" if use_merged else "直接发图"
             return (
-                f"已成功将 {len(paths)} 张图片通过【{mode_label}】转发至 {cross_target_desc}！"
-                f"（对应图片池编号: {', '.join(registered_ids)}）。"
-                "请用简短自然的语气告知用户图片已发出，无需再调用其他发图工具。"
+                f"已成功将 {len(paths)} 张图片通过【{mode_label}】发送至 {cross_target_desc}（编号: {', '.join(registered_ids)}）。"
             )
         except Exception as e:
             self._log.error(f"[MinimalDraw] 转发图片失败: {e}", exc_info=True)
@@ -1443,16 +1401,33 @@ class MinimalVisionDrawPlugin(star.Star):
         output_format: str = "png",
         size: str = "",
         high_precision: bool = False,
+        frame_count: int = 0,
+        fps: float = 0.0,
+        frame_duration_ms: int = 0,
     ) -> str:
-        """使用 OpenAI 图像模型生成静态图或 GIF 动图（文生图），或基于任意来源的单张/多张参考图进行修改/风格转换/动图化/多图融合（图生图）。
-        生成的图片或动图会自动直接发送到当前聊天窗口，并存入近期图片池供后续连续修改。所有参数均有默认兜底。
+        """【工具是什么】：OpenAI 图像模型生图、改图、多图融合与原生 GIF 动图生成工具。
+        【功能】：文生静态图/动图，或基于任意单张/多张参考图进行修改、风格转换、动图化与多图融合。生成的图片或动图直接发送至当前会话并存入图片池。
+        【返回状态】：生成模式、输出格式（动图附带帧数/单帧时长/帧率/总时长）、使用模型、画质档位及图片编号（#IMG_n）。
+        【客观参数范围与换算】：
+        - 帧数 frame_count：理论有效区间 2~16 帧（API 物理上限 16 帧，默认 9 帧）。
+        - 单帧时长 frame_duration_ms：理论有效区间 20~2000 ms（对应 0.5~50 fps，默认 180ms）。
+        - 物理换算公式：frame_duration_ms = round(1000 / fps)，动图总时长(秒) = frame_count * (frame_duration_ms / 1000) = frame_count / fps。
+        【最小例子】：
+        - draw_image(prompt="水彩风风景画")：基础文生图
+        - draw_image(prompt="融合两图特征", image_source="IMG_1,IMG_2")：多图融合
+        - draw_image(prompt="日落分镜叙事", output_format="gif", frame_count=16, fps=1)：慢速叙事动图（16帧/1fps/16秒故事流）
+        - draw_image(prompt="流体循环动效", output_format="gif", frame_count=16, fps=16)：极速流畅微循环（16帧/16fps/1秒）
+        - draw_image(prompt="日常动作表情包", output_format="gif", frame_count=8, fps=8)：标准节奏动图（8帧/8fps/1秒）
 
         Args:
-            prompt(string): 画面描述或修改/融合指令（如 "一只穿宇航服的橘猫" 或 "把图1的角色和图2的服装背景融合在一起" 或 "改成循环挥手的Q版动图表情包"）
-            image_source(string): 可选参考图来源（支持逗号或+号分隔任意多图进行多图融合，如 "IMG_1,IMG_2" 或 "self_avatar,at_avatar"）。留空("")时自动提取本条消息(含合并转发/原图文件/URL)或引用消息中的所有图片作为参考图，若无图则执行文生图；支持填："IMG_1"、"1-3"、"latest"（最近一张）、"forward"（合并转发内的图片）、"my_latest"（该用户在私聊/其他会话刚发的图）、"self_avatar"（发送者头像）、"at_avatar"（被@群友头像，支持同时@多人提取多头像融合）、"bot_avatar"（机器人头像）、"avatar:QQ号"、"group_avatar"（群头像）或任意图片 URL/路径；强制纯文生图可填 "none"
-            output_format(string): 可选输出格式。默认 "png"（静态图）；当用户要求生成动图、GIF、动态表情包或让图片动起来时，请填 "gif"
-            size(string): 可选尺寸。留空默认自动匹配（静态图 "1024x1024"，GIF 动图自动使用 "auto"），静态图也可填 "1024x1536"（竖图）、"1536x1024"（横图）
-            high_precision(boolean): 是否使用高级/高精度精绘模型。默认 false（使用轻量快速模型），true 则使用高级旗舰模型，请结合对话上下文自由判断
+            prompt(string): 画面描述或修改/融合指令（如 "一只穿宇航服的橘猫" 或 "把图1与图2融合"）
+            image_source(string): 参考图来源（支持逗号或加号组合多图融合）。留空("")自动提取当前或引用消息中的全部图片；可填 "IMG_1"、"1-3"、"latest"、"forward"（合并转发图）、"my_latest"、"self_avatar"、"at_avatar"、"avatar:QQ号"、"group_avatar" 或网络 URL/本地路径；强制纯文生图填 "none"
+            output_format(string): 输出格式。默认 "png"（静态图，也支持 jpeg/webp）；生成动图填 "gif"（若传入了 frame_count/fps/frame_duration_ms 也会自动识别为 gif）
+            size(string): 画面尺寸。留空自动匹配（静态图默认 1024x1024，GIF 动图自动使用 auto），静态图可填 "1024x1024"、"1024x1536"、"1536x1024"
+            high_precision(boolean): 是否请求高级/高精度精绘模型。默认 false，true 则请求高级旗舰模型
+            frame_count(number): GIF 总帧数。有效范围 2~16 帧（API 上限 16 帧）。留空或填 0 时使用默认值（9 帧）
+            fps(number): GIF 播放帧率（每秒播放帧数，范围 0.5~50 fps）。自动换算单帧时长 round(1000 / fps)。若与 frame_duration_ms 同时提供，优先使用 frame_duration_ms。留空或填 0 时使用默认帧率（约 5.5 fps）
+            frame_duration_ms(number): GIF 单帧停留时长（毫秒，有效范围 20~2000 ms）。与 fps 二选一。留空或填 0 时使用默认值（180ms）
         """
         umo = event.unified_msg_origin
         is_adm = self._is_sender_admin(event)
@@ -1493,6 +1468,10 @@ class MinimalVisionDrawPlugin(star.Star):
         if fmt not in {"png", "jpeg", "webp", "gif"}:
             fmt = "gif" if "gif" in fmt or "动图" in fmt else "png"
 
+        # 若显式传入了动图参数，自动确定为 GIF
+        if (frame_count and frame_count > 0) or (fps and fps > 0) or (frame_duration_ms and frame_duration_ms > 0):
+            fmt = "gif"
+
         if fmt == "gif":
             final_size = "auto"
         else:
@@ -1502,9 +1481,26 @@ class MinimalVisionDrawPlugin(star.Star):
         client = AsyncOpenAI(api_key=api_key, base_url=api_base, timeout=req_timeout)
 
         extra_kwargs: dict[str, Any] = {"output_format": fmt}
+        final_fc: int = 0
+        final_dur: int = 0
         if fmt == "gif":
-            extra_kwargs["frame_count"] = self._gif_frame_count()
-            extra_kwargs["frame_duration_ms"] = self._gif_frame_duration_ms()
+            # 1. 确定 frame_count (限制在 API 物理允许的 2 ~ 16 帧)
+            if frame_count and frame_count > 0:
+                final_fc = max(2, min(16, int(round(frame_count))))
+            else:
+                final_fc = self._gif_frame_count()
+
+            # 2. 确定 frame_duration_ms (限制在 API 物理允许的 20 ~ 2000 ms)
+            if frame_duration_ms and frame_duration_ms > 0:
+                final_dur = max(20, min(2000, int(round(frame_duration_ms))))
+            elif fps and fps > 0:
+                calc_ms = round(1000.0 / float(fps))
+                final_dur = max(20, min(2000, int(calc_ms)))
+            else:
+                final_dur = self._gif_frame_duration_ms()
+
+            extra_kwargs["frame_count"] = final_fc
+            extra_kwargs["frame_duration_ms"] = final_dur
 
         try:
             if ref_paths:
@@ -1522,7 +1518,9 @@ class MinimalVisionDrawPlugin(star.Star):
                         else "图生图"
                     )
                     if fmt == "gif":
-                        mode_desc += "+GIF动图化"
+                        calc_fps = round(1000.0 / final_dur, 1)
+                        total_sec = round(final_fc * final_dur / 1000.0, 1)
+                        mode_desc += f"+GIF动图化({final_fc}帧/{final_dur}ms/约{calc_fps}fps/总长{total_sec}s)"
                     self._log.info(
                         f"[MinimalDraw] 正在调用 {model_name} 执行{mode_desc}: prompt={final_prompt[:60]!r}, format={fmt}, size={final_size}, quality={final_quality}"
                     )
@@ -1569,7 +1567,12 @@ class MinimalVisionDrawPlugin(star.Star):
                         **extra_kwargs,
                     )
             else:
-                mode_desc = "文生GIF动图" if fmt == "gif" else "文生图"
+                if fmt == "gif":
+                    calc_fps = round(1000.0 / final_dur, 1)
+                    total_sec = round(final_fc * final_dur / 1000.0, 1)
+                    mode_desc = f"文生GIF动图({final_fc}帧/{final_dur}ms/约{calc_fps}fps/总长{total_sec}s)"
+                else:
+                    mode_desc = "文生图"
                 self._log.info(
                     f"[MinimalDraw] 正在调用 {model_name} 执行{mode_desc}: prompt={final_prompt[:60]!r}, format={fmt}, size={final_size}, quality={final_quality}"
                 )
@@ -1612,12 +1615,15 @@ class MinimalVisionDrawPlugin(star.Star):
                 MessageChain(chain=[Comp.Image.fromFileSystem(str(out_path))])
             )
 
+            gif_detail = (
+                f"，{final_fc}帧/{final_dur}ms/约{round(1000.0 / final_dur, 1)}fps/总长{round(final_fc * final_dur / 1000.0, 1)}s"
+                if fmt == "gif"
+                else ""
+            )
             notice_str = f" | {perm_notice}" if perm_notice else ""
             return (
-                f"图片已成功生成并发送给用户！"
-                f"（模式: {mode_desc}，格式: {fmt.upper()}，模型: {model_name}，画质: {final_quality}"
-                f"{notice_str}，新图编号: #{cached_item.image_id}）。"
-                f"请用简短自然的语气告知用户图片已画好，无需再调用任何发图工具。"
+                f"图片已生成并发送（模式: {mode_desc}，格式: {fmt.upper()}{gif_detail}，模型: {model_name}，画质: {final_quality}"
+                f"{notice_str}，编号: #{cached_item.image_id}）。"
             )
         except Exception as e:
             self._log.error(f"[MinimalDraw] 生图失败: {e}", exc_info=True)

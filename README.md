@@ -73,8 +73,9 @@ git clone https://github.com/zjj1280637679-ship-it/astrbot_plugin_minimal_draw.g
 - **全能多图融合 (`images.edit`)**：
   - `image_source` 支持用逗号（`,`）或加号（`+`）任意混搭最多 **6 张不同来源的参考图**；
   - 优先通过 OpenAI 原生多图数组 `image=[file1, file2, ...]` 上传；若遇到不支持多文件数组的兼容接口，自动触发 `_stitch_images_grid_png` 智能网格画布拼接兜底，确保 100% 融合成功。
-- **原生 GIF 动图生成 (`output_format="gif"`)**：
-  - 支持纯文生 GIF 动图，也支持将单张参考图或多张融合图转化为循环动态 GIF 表情包（可在插件设置中自定义帧数与单帧时长）。
+- **原生 GIF 动图生成与全参数节奏控制 (`output_format="gif"`)**：
+  - 支持纯文生 GIF 动图，也支持将单张参考图或多张融合图转化为循环动态 GIF 表情包。
+  - **精细物理参数与节奏策略**：向主模型开放 `frame_count`（2~16 帧）、`fps`（0.5~50 fps）与 `frame_duration_ms`（20~2000 ms），支持从 1 fps/16 帧（16 秒长线分镜叙事流）到 16 fps/16 帧（1 秒极速丝滑循环）等任意节奏，由 AI 根据情境自主决定动效策略。
 - **上下文驱动的管理员双档位分权 + OpenAI 前缀缓存保护**：
   - 日常默认极速档：`gpt-image-2.6-flare` + `low`（180s 超时）；
   - 管理员专属旗舰档：`gpt-image-2.6-sunburst` + `high`（360s 超时），通过 `req.extra_user_content_parts` + `mark_as_temp()` 尾部临时注入权限提醒，严禁污染顶部 `system_prompt`，实测保持 **95%+ 的 OpenAI Prompt Caching 命中率**。
@@ -89,7 +90,7 @@ git clone https://github.com/zjj1280637679-ship-it/astrbot_plugin_minimal_draw.g
 | :--- | :--- | :--- |
 | `view_recent_images` | `count: int = 5` | 多图视觉观察：调取最近 `N` 张图片画面、编号 `#IMG_n`、发送者与配文 |
 | `forward_images` | `image_source: str = "latest"`<br>`forward_mode: str = "auto"`<br>`caption: str = ""`<br>`target: str = ""` | 原图提取与转发：将任意来源的单图/多图直接发送或打包为合并转发卡片，支持跨会话投递 |
-| `draw_image` | `prompt: str = ""`<br>`image_source: str = ""`<br>`output_format: str = "png"`<br>`size: str = ""`<br>`high_precision: bool = False` | 文生图 / 图生图 / 多图融合 / GIF 动图生成（支持管理员上下文双档位分权） |
+| `draw_image` | `prompt: str = ""`<br>`image_source: str = ""`<br>`output_format: str = "png"`<br>`size: str = ""`<br>`high_precision: bool = False`<br>`frame_count: int = 0`<br>`fps: float = 0.0`<br>`frame_duration_ms: int = 0` | 文生图 / 图生图 / 多图融合 / GIF 动图全节奏生成（支持管理员上下文双档位分权与 2~16 帧、0.5~50 fps 自主策略调控） |
 | `/img_pool` | 无 | 查看当前会话图片缓存池状态、图片编号、角色与来源摘要 |
 | `/img_clear` | 无 | 清空当前会话的图片缓存池 |
 
