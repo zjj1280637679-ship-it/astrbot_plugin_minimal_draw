@@ -1,0 +1,97 @@
+{
+  "model": {
+    "description": "默认生图模型（日常便宜极速档）",
+    "type": "string",
+    "default": "gpt-image-2.6-flare",
+    "hint": "所有人日常默认使用的便宜模型，推荐 gpt-image-2.6-flare 或 gpt-image-1-mini"
+  },
+  "default_quality": {
+    "description": "默认生图画质档位",
+    "type": "string",
+    "default": "low",
+    "options": ["low", "medium", "high", "auto"],
+    "hint": "日常默认不填精度时使用的省流档位（low 约 $0.006/张）"
+  },
+  "high_precision_model": {
+    "description": "管理员专属高精度模型（旗舰精绘档）",
+    "type": "string",
+    "default": "gpt-image-2.6-sunburst",
+    "hint": "仅当管理员结合上下文要求高质量/精绘时自动切换的旗舰模型，推荐 gpt-image-2.6-sunburst"
+  },
+  "high_precision_quality": {
+    "description": "管理员高精度档画质",
+    "type": "string",
+    "default": "high",
+    "options": ["high", "medium", "auto"],
+    "hint": "管理员触发高精度时的画质档位（high 旗舰精绘质量最高）"
+  },
+  "admin_qq_list": {
+    "description": "额外允许使用高精度模型的管理员 ID 列表（逗号分隔，可留空）",
+    "type": "string",
+    "default": "",
+    "hint": "默认自动识别 AstrBot 全局管理员 (admins_id)；如需额外授权其他 QQ 号，可在此填写（多个用逗号分隔）"
+  },
+  "non_admin_high_policy": {
+    "description": "普通群友要求高精度时的处理策略",
+    "type": "string",
+    "default": "downgrade",
+    "options": ["downgrade", "reject"],
+    "hint": "downgrade: 自动静默降级为便宜模型(flare+low)继续生成；reject: 直接拒绝生成并提示仅限管理员"
+  },
+  "non_admin_cooldown_seconds": {
+    "description": "普通群友生图冷却时间（秒）",
+    "type": "int",
+    "default": 10,
+    "hint": "防止非管理员频繁刷图的冷却间隔（秒），设为 0 则不限制；管理员不受此冷却限制"
+  },
+  "default_size": {
+    "description": "默认静态图片尺寸",
+    "type": "string",
+    "default": "1024x1024",
+    "options": ["1024x1024", "1024x1536", "1536x1024", "auto"],
+    "hint": "1024x1024(方图)、1024x1536(竖图)、1536x1024(横图)；GIF 动图会自动使用 auto"
+  },
+  "gif_frame_count": {
+    "description": "GIF 动图默认帧数",
+    "type": "int",
+    "default": 9,
+    "hint": "生成 GIF 动图时的帧数（建议 4 ~ 16 帧，默认 9 帧）"
+  },
+  "gif_frame_duration_ms": {
+    "description": "GIF 动图单帧时长（毫秒）",
+    "type": "int",
+    "default": 180,
+    "hint": "生成 GIF 动图时每帧的停留毫秒数（越小播放越快，默认 180ms）"
+  },
+  "default_view_count": {
+    "description": "视野工具默认查看图片数量 (N)",
+    "type": "int",
+    "default": 5,
+    "hint": "view_recent_images 工具不传参时默认查看最近 N 张图片（AI 调用时可动态传参调整）"
+  },
+  "max_cache_per_session": {
+    "description": "每个群聊/私聊缓存近期图片上限",
+    "type": "int",
+    "default": 20,
+    "hint": "每个会话环形队列保留最近多少张图片供视野工具和图生图调取"
+  },
+  "max_disk_cache_files": {
+    "description": "磁盘缓存图片文件总数上限",
+    "type": "int",
+    "default": 100,
+    "hint": "超出上限时自动清理最旧且不再被活跃会话引用的缓存图片，防止磁盘无限膨胀"
+  },
+  "api_key": {
+    "description": "自定义 OpenAI API Key（可留空）",
+    "type": "string",
+    "secret": true,
+    "default": "",
+    "hint": "留空则自动复用你在 AstrBot 模型提供商里已配置的 OpenAI API Key"
+  },
+  "api_base": {
+    "description": "自定义 API Base URL（可留空）",
+    "type": "string",
+    "default": "",
+    "hint": "留空则自动复用 AstrBot 已配置的 OpenAI API Base (默认 https://api.openai.com/v1)"
+  }
+}

@@ -1,0 +1,32 @@
+name: astrbot_plugin_minimal_draw
+display_name: 极简视觉视野与生图 (OpenAI)
+desc: >-
+  提供零闲置视觉 Token 消耗的群聊主动多图视野 (view_recent_images)、
+  全渠道任意来源图片提取与转发 (forward_images，支持合并转发拆图/打包、跨会话调图、群/个人头像、外链防盗链)
+  以及管理员双档位分权的 OpenAI 文生图、图生图、多图融合与原生 GIF 动图生成工具 (draw_image)。
+short_desc: 零闲置Token多图视野 + 任意来源图片转发/合并转发拆包 + 双档位分权 OpenAI 文生图/多图融合/GIF插件
+help: >-
+  1. AI 自动按需调用 view_recent_images(count) 观察近期图片；
+  2. AI 调用 forward_images 提取转发合并转发内图片、跨会话图、QQ头像或外链图；
+  3. AI 调用 draw_image 进行文生图、任意来源多图融合改图、生成原生 GIF 动图；
+  4. 指令：/img_pool 查看当前会话图片池，/img_clear 清空当前会话图片池。
+version: 1.2.0
+author: zjj1280637679-ship-it
+repo: https://github.com/zjj1280637679-ship-it/astrbot_plugin_minimal_draw
+social_link: https://github.com/zjj1280637679-ship-it
+astrbot_version: ">=4.16,<5"
+support_platforms:
+  - aiocqhttp
+  - qq_official
+  - telegram
+  - lark
+  - discord
+  - weixin_oc
+tags:
+  - 生图
+  - 图生图
+  - 多图融合
+  - 图片转发
+  - 视觉视野
+  - GIF动图
+  - OpenAI
