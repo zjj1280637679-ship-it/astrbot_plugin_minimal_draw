@@ -51,6 +51,13 @@
     "options": ["1024x1024", "1024x1536", "1536x1024", "auto"],
     "hint": "1024x1024(方图)、1024x1536(竖图)、1536x1024(横图)；GIF 动图会自动使用 auto"
   },
+  "default_background": {
+    "description": "默认背景模式（透明底/实色底/自动）",
+    "type": "string",
+    "default": "auto",
+    "options": ["auto", "transparent", "opaque"],
+    "hint": "auto: 根据画面描述自动判断；transparent: 默认生成带 Alpha 通道的透明底/幽灵图；opaque: 默认实色背景"
+  },
   "gif_frame_count": {
     "description": "GIF 动图默认帧数",
     "type": "int",
@@ -93,5 +100,17 @@
     "type": "string",
     "default": "",
     "hint": "留空则自动复用 AstrBot 已配置的 OpenAI API Base (默认 https://api.openai.com/v1)"
+  },
+  "request_timeout_seconds": {
+    "description": "标准模型生图超时时间（秒）",
+    "type": "int",
+    "default": 300,
+    "hint": "标准生图接口等待超时的最大秒数（默认 300 秒，宽容处理大图生成）"
+  },
+  "high_precision_timeout_seconds": {
+    "description": "旗舰高级模型生图超时时间（秒）",
+    "type": "int",
+    "default": 480,
+    "hint": "旗舰高级模型生图接口等待超时的最大秒数（默认 480 秒）"
   }
 }

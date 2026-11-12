@@ -110,7 +110,7 @@ class MinimalVisionDrawPlugin(star.Star):
     async def initialize(self) -> None:
         """插件激活/加载生命周期钩子"""
         if self._http_session is None or self._http_session.closed:
-            timeout = aiohttp.ClientTimeout(total=25)
+            timeout = aiohttp.ClientTimeout(total=90, connect=15)
             self._http_session = aiohttp.ClientSession(
                 timeout=timeout,
                 headers={"User-Agent": "Mozilla/5.0 (AstrBot MinimalDrawPlugin/1.2)"},
@@ -136,7 +136,7 @@ class MinimalVisionDrawPlugin(star.Star):
 
     async def _get_http_session(self) -> aiohttp.ClientSession:
         if self._http_session is None or self._http_session.closed:
-            timeout = aiohttp.ClientTimeout(total=25)
+            timeout = aiohttp.ClientTimeout(total=90, connect=15)
             self._http_session = aiohttp.ClientSession(
                 timeout=timeout,
                 headers={"User-Agent": "Mozilla/5.0 (AstrBot MinimalDrawPlugin/1.2)"},
@@ -320,8 +320,9 @@ class MinimalVisionDrawPlugin(star.Star):
         self,
         event: AstrMessageEvent,
         high_precision: bool,
+        explicit_model: str = "",
     ) -> tuple[str, str, float, str | None]:
-        """根据是否请求高精度及发送者管理员权限，决定最终使用的模型、画质档位与超时时间。"""
+        """根据是否请求高精度、显式指定的模型ID及发送者管理员权限，决定最终使用的模型、画质档位与超时时间。"""
         cheap_model = (
             str(self.config.get("model", "gpt-image-2.6-flare") or "").strip()
             or "gpt-image-2.6-flare"
@@ -331,44 +332,81 @@ class MinimalVisionDrawPlugin(star.Star):
             or "low"
         )
 
-        if not high_precision:
-            return cheap_model, cheap_quality, 180.0, None
+        timeout_std = float(self.config.get("request_timeout_seconds", 300.0) or 300.0)
+        timeout_pro = float(self.config.get("high_precision_timeout_seconds", 480.0) or 480.0)
 
-        if self._is_sender_admin(event):
-            pro_model = (
-                str(
-                    self.config.get("high_precision_model", "gpt-image-2.6-sunburst")
-                    or ""
-                ).strip()
-                or "gpt-image-2.6-sunburst"
-            )
-            pro_quality = (
-                str(self.config.get("high_precision_quality", "high") or "")
+        is_admin = self._is_sender_admin(event)
+
+        # 1. 检查是否有对话显式指定的生图模型 ID
+        target_model = str(explicit_model or "").strip()
+        # 如果未在参数中传 model，但在用户上下文消息中检测到具体的模型名称特征
+        if not target_model:
+            msg_str = str(getattr(event, "message_str", "") or "").lower()
+            if "sunburst" in msg_str:
+                target_model = "gpt-image-2.6-sunburst"
+            elif "flare" in msg_str:
+                target_model = "gpt-image-2.6-flare"
+            elif "dall-e-3" in msg_str or "dalle3" in msg_str:
+                target_model = "dall-e-3"
+            elif "dall-e-2" in msg_str or "dalle2" in msg_str:
+                target_model = "dall-e-2"
+
+        # 判断请求的模型是否属于高级旗舰模型
+        is_high_model = (
+            bool(high_precision)
+            or any(k in target_model.lower() for k in ("sunburst", "pro", "dall-e-3", "plus", "ultra"))
+        )
+
+        # 2. 如果发送者是管理员：完全尊重管理员显式指定的模型，享有最高自由度
+        if is_admin:
+            if target_model:
+                chosen_model = target_model
+                chosen_quality = "high" if is_high_model else cheap_quality
+                chosen_timeout = timeout_pro if is_high_model else timeout_std
+                notice = f"⚡已验证管理员权限，根据对话指令直接指定模型: {chosen_model}"
+                return chosen_model, chosen_quality, chosen_timeout, notice
+            elif high_precision:
+                pro_model = (
+                    str(
+                        self.config.get("high_precision_model", "gpt-image-2.6-sunburst")
+                        or ""
+                    ).strip()
+                    or "gpt-image-2.6-sunburst"
+                )
+                pro_quality = (
+                    str(self.config.get("high_precision_quality", "high") or "")
+                    .strip()
+                    .lower()
+                    or "high"
+                )
+                return (
+                    pro_model,
+                    pro_quality,
+                    timeout_pro,
+                    f"⚡已验证管理员权限，启用旗舰高级模型 ({pro_model} + {pro_quality})",
+                )
+            else:
+                return cheap_model, cheap_quality, timeout_std, None
+
+        # 3. 如果发送者非管理员：
+        if is_high_model:
+            policy = (
+                str(self.config.get("non_admin_high_policy", "downgrade") or "")
                 .strip()
                 .lower()
-                or "high"
             )
+            if policy == "reject":
+                return "", "", timeout_std, "REJECT_NON_ADMIN"
+
             return (
-                pro_model,
-                pro_quality,
-                360.0,
-                f"⚡已验证管理员权限，启用旗舰高级模型 ({pro_model} + {pro_quality})",
+                cheap_model,
+                cheap_quality,
+                timeout_std,
+                "⚠️当前用户非管理员，高级模型请求已由系统权限锁自动降级为标准省流模型生成",
             )
 
-        policy = (
-            str(self.config.get("non_admin_high_policy", "downgrade") or "")
-            .strip()
-            .lower()
-        )
-        if policy == "reject":
-            return "", "", 180.0, "REJECT_NON_ADMIN"
-
-        return (
-            cheap_model,
-            cheap_quality,
-            180.0,
-            "⚠️当前用户非管理员，高级模型请求已由系统权限锁自动降级为标准省流模型生成",
-        )
+        chosen_model = target_model if target_model else cheap_model
+        return chosen_model, cheap_quality, timeout_std, None
 
     def _resolve_openai_credentials(self, umo: str | None = None) -> tuple[str, str]:
         """获取 OpenAI API Key 和 Base URL，优先读插件配置，留空则自动复用 AstrBot 主配置"""
@@ -837,6 +875,58 @@ class MinimalVisionDrawPlugin(star.Star):
         buf = io.BytesIO()
         canvas.save(buf, format="PNG")
         return buf.getvalue()
+
+    @classmethod
+    def _prepare_send_image_path(cls, original_path: Path, fmt: str) -> Path:
+        """为 QQ 等平台消息发送准备轻量、高质量的图像文件。
+        - 针对具有透明通道的图像（Alpha Channel / RGBA / 幽灵图 / 抠图贴纸），绝对不转为 JPEG（JPEG 会破坏透明度变黑/白底），
+          而是保持 PNG 或生成优化压缩的透明 PNG，100% 保持原生透明通道与幽灵图显示效果。
+        - 针对无透明通道的普通纯色静态大图(>800KB)，生成高质紧凑 JPEG 专发副本，大幅减少 Base64 传输与 NTQQ 上传等待。
+        - 原始高清大图始终完整保存在本地缓存与图片池中。
+        """
+        try:
+            if fmt == "gif" or not original_path.exists():
+                return original_path
+
+            # 若文件体积已较小 (<= 800KB)，无需二次优化，直接原样发送
+            st_size = original_path.stat().st_size
+            if st_size <= 800 * 1024:
+                return original_path
+
+            with PILImage.open(original_path) as im:
+                # 检查是否存在真实透明通道 (Alpha Channel / 幽灵图 / 抠图贴纸)
+                is_transparent = False
+                if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
+                    if im.mode == "P":
+                        is_transparent = True
+                    else:
+                        alpha_channel = im.getchannel("A") if "A" in im.getbands() else None
+                        if alpha_channel:
+                            min_val, _ = alpha_channel.getextrema()
+                            if min_val < 255:  # 存在非完全不透明的像素
+                                is_transparent = True
+
+                if is_transparent:
+                    # 存在透明通道：绝不能转成 JPEG（JPEG 不支持透明度会变成黑底或白底）
+                    # 生成针对透明大图的高效 PNG 优化副本
+                    opt_png = original_path.with_name(f"{original_path.stem}_send.png")
+                    if opt_png.exists() and opt_png.stat().st_size > 0:
+                        return opt_png
+                    # 保存为优化 PNG，保留完整透明通道
+                    im.save(opt_png, format="PNG", optimize=True)
+                    return opt_png
+
+                # 纯实底静态大图：生成高质紧凑 JPEG
+                opt_jpg = original_path.with_name(f"{original_path.stem}_send.jpg")
+                if opt_jpg.exists() and opt_jpg.stat().st_size > 0:
+                    return opt_jpg
+
+                rgb_im = im.convert("RGB")
+                rgb_im.save(opt_jpg, format="JPEG", quality=92, optimize=True)
+                return opt_jpg
+        except Exception as e:
+            logger.debug(f"[MinimalDraw] 预处理发送图片异常，回退使用原图: {e}")
+            return original_path
 
     @filter.llm_tool(name="view_recent_images")
     async def view_recent_images(
@@ -1353,21 +1443,31 @@ class MinimalVisionDrawPlugin(star.Star):
                     segs.append(Comp.Image.fromFileSystem(p))
                 chain = MessageChain(chain=segs)
 
-            if same_session or bot is None:
-                await event.send(chain)
-            else:
-                from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
-                    AiocqhttpMessageEvent,
-                )
+            try:
+                if same_session or bot is None:
+                    await event.send(chain)
+                else:
+                    from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
+                        AiocqhttpMessageEvent,
+                    )
 
-                raw_ev = getattr(event.message_obj, "raw_message", None)
-                await AiocqhttpMessageEvent.send_message(
-                    bot=bot,
-                    message_chain=chain,
-                    event=raw_ev,
-                    is_group=target_is_group,
-                    session_id=target_session_id,
-                )
+                    raw_ev = getattr(event.message_obj, "raw_message", None)
+                    await AiocqhttpMessageEvent.send_message(
+                        bot=bot,
+                        message_chain=chain,
+                        event=raw_ev,
+                        is_group=target_is_group,
+                        session_id=target_session_id,
+                    )
+            except Exception as send_err:
+                err_text = str(send_err)
+                if "1200" in err_text or "Timeout" in err_text or "NTEvent" in err_text:
+                    self._log.warning(
+                        f"[MinimalDraw] 转发图片触发 NTQQ 异步确认超时 (retcode=1200)，"
+                        f"但内核后台已在投递并发送: {send_err}"
+                    )
+                else:
+                    raise send_err
 
             mode_label = "合并转发卡片" if use_merged else "直接发图"
             return (
@@ -1397,34 +1497,49 @@ class MinimalVisionDrawPlugin(star.Star):
         self,
         event: AstrMessageEvent,
         prompt: str = "",
+        model: str = "",
         image_source: str = "",
         output_format: str = "png",
+        background: str = "auto",
         size: str = "",
         high_precision: bool = False,
+        quality: str = "",
+        complexity: str = "auto",
         frame_count: int = 0,
         fps: float = 0.0,
         frame_duration_ms: int = 0,
     ) -> str:
-        """【工具是什么】：OpenAI 图像模型生图、改图、多图融合与原生 GIF 动图生成工具。
-        【功能】：文生静态图/动图，或基于任意单张/多张参考图进行修改、风格转换、动图化与多图融合。生成的图片或动图直接发送至当前会话并存入图片池。
-        【返回状态】：生成模式、输出格式（动图附带帧数/单帧时长/帧率/总时长）、使用模型、画质档位及图片编号（#IMG_n）。
+        """【工具是什么】：OpenAI 旗舰图像模型生图、智能抠图、多图融合、幽灵图与原生 GIF 动图生成工具。
+        【功能】：文生静态图/动图、透明底幽灵图、免抠贴纸，或基于任意单张/多张参考图进行修改、风格转换、抠图去底、动图化与多图融合。生成的图片或动图直接发送至当前会话并存入图片池。
+        【返回状态】：生成模式、输出格式（动图附带帧数/单帧时长/帧率/总时长）、背景模式（透明底/实底）、使用模型、画质档位及图片编号（#IMG_n）。
         【客观参数范围与换算】：
+        - 模型选择 model：显式指定生图模型ID（如 "gpt-image-2.6-sunburst"、"gpt-image-2.6-flare"、"dall-e-3"）。管理员可在对话中根据需求自由指定任意模型；留空则根据 high_precision 自动选取。
+        - 背景模式 background：
+          * transparent：【透明背景 / 幽灵图 / 抠图贴纸 / 原生Alpha通道】。去除画面背景，输出带原生 Alpha 透明通道的 PNG/WebP（在 QQ 中呈现浮空幽灵图/透明贴纸表情包）。用户要求“透明底”、“透明背景”、“幽灵图”、“抠图”、“贴纸”、“表情包”、“无背景”、“透明通道”时必须使用此参数。
+          * opaque：【实色背景】。强制生成带有完整环境或实色背景的图像。
+          * auto：【自动模式，默认】。由模型根据画面描述自主决定是否有背景。
         - 帧数 frame_count：理论有效区间 2~16 帧（API 物理上限 16 帧，默认 9 帧）。
         - 单帧时长 frame_duration_ms：理论有效区间 20~2000 ms（对应 0.5~50 fps，默认 180ms）。
         - 物理换算公式：frame_duration_ms = round(1000 / fps)，动图总时长(秒) = frame_count * (frame_duration_ms / 1000) = frame_count / fps。
         【最小例子】：
+        - draw_image(prompt="可爱的幽灵猫咪表情包", background="transparent")：纯透明底幽灵图/贴纸 (原生透明通道)
+        - draw_image(prompt="把这张图的主体抠出来做成透明底贴纸", image_source="latest", background="transparent")：图生图智能抠图去底
         - draw_image(prompt="水彩风风景画")：基础文生图
+        - draw_image(prompt="用sunburst画一张未来赛博朋克城市", model="gpt-image-2.6-sunburst")：指定模型ID生图
         - draw_image(prompt="融合两图特征", image_source="IMG_1,IMG_2")：多图融合
         - draw_image(prompt="日落分镜叙事", output_format="gif", frame_count=16, fps=1)：慢速叙事动图（16帧/1fps/16秒故事流）
-        - draw_image(prompt="流体循环动效", output_format="gif", frame_count=16, fps=16)：极速流畅微循环（16帧/16fps/1秒）
-        - draw_image(prompt="日常动作表情包", output_format="gif", frame_count=8, fps=8)：标准节奏动图（8帧/8fps/1秒）
+        - draw_image(prompt="日常动作表情包", output_format="gif", background="transparent", frame_count=8, fps=8)：透明底动态表情包
 
         Args:
-            prompt(string): 画面描述或修改/融合指令（如 "一只穿宇航服的橘猫" 或 "把图1与图2融合"）
+            prompt(string): 画面描述或修改/融合/抠图指令（如 "一只穿宇航服的橘猫"、"可爱的幽灵柴犬透明贴纸" 或 "把图1与图2融合"）
+            model(string): 显式指定使用的生图模型 ID（如 "gpt-image-2.6-sunburst"、"gpt-image-2.6-flare"、"dall-e-3"）。管理员可在对话中自由指定任意模型；留空则根据 high_precision 自动匹配
             image_source(string): 参考图来源（支持逗号或加号组合多图融合）。留空("")自动提取当前或引用消息中的全部图片；可填 "IMG_1"、"1-3"、"latest"、"forward"（合并转发图）、"my_latest"、"self_avatar"、"at_avatar"、"avatar:QQ号"、"group_avatar" 或网络 URL/本地路径；强制纯文生图填 "none"
-            output_format(string): 输出格式。默认 "png"（静态图，也支持 jpeg/webp）；生成动图填 "gif"（若传入了 frame_count/fps/frame_duration_ms 也会自动识别为 gif）
-            size(string): 画面尺寸。留空自动匹配（静态图默认 1024x1024，GIF 动图自动使用 auto），静态图可填 "1024x1024"、"1024x1536"、"1536x1024"
-            high_precision(boolean): 是否请求高级/高精度精绘模型。默认 false，true 则请求高级旗舰模型
+            output_format(string): 输出格式。默认 "png"（静态图推荐，完整保留透明通道）；也支持 "webp"（轻量透明图）、"jpeg"（仅限纯实底图）、"gif"（动图）、"svg"（矢量图）。注意：当 background="transparent" 时，格式必须为 png 或 webp，严禁使用 jpeg
+            background(string): 画面背景模式与透明通道控制。可选 'transparent' (透明底/幽灵图/抠图贴纸/原生Alpha通道)、'opaque' (实色背景)、'auto' (自动判断，默认)。当用户提及透明底、透明图、幽灵图、抠图、贴纸、表情包、无背景或透明通道时必须设为 'transparent'
+            size(string): 画面尺寸或比例。留空自动匹配（静态图默认 1024x1024，GIF 动图自动使用 auto），静态图可填 "1024x1024"、"1024x1536"、"1536x1024"、"1:1"、"16:9"、"9:16"、"3:2"、"4:3"
+            high_precision(boolean): 是否请求高级/高精度精绘模型。默认 false，true 则请求高级旗舰模型 (如 gpt-image-2.6-sunburst)
+            quality(string): 画质档位。可选 'low', 'medium', 'high', 'xhigh', 'max', 'auto'。留空根据 high_precision 自动决定
+            complexity(string): 画面思考与规划复杂度。可选 'low' (快速迭代/抠图去底/轻量修改)、'medium'、'high' (复杂构图/高难文字排版)、'auto' (默认)
             frame_count(number): GIF 总帧数。有效范围 2~16 帧（API 上限 16 帧）。留空或填 0 时使用默认值（9 帧）
             fps(number): GIF 播放帧率（每秒播放帧数，范围 0.5~50 fps）。自动换算单帧时长 round(1000 / fps)。若与 frame_duration_ms 同时提供，优先使用 frame_duration_ms。留空或填 0 时使用默认帧率（约 5.5 fps）
             frame_duration_ms(number): GIF 单帧停留时长（毫秒，有效范围 20~2000 ms）。与 fps 二选一。留空或填 0 时使用默认值（180ms）
@@ -1448,12 +1563,25 @@ class MinimalVisionDrawPlugin(star.Star):
         if not api_key:
             return "生图失败：未找到可用的 OpenAI API Key，请在插件设置或 AstrBot 模型提供商中配置。"
 
-        want_high = bool(high_precision)
+        explicit_model_clean = str(model or "").strip()
+        want_high = (
+            bool(high_precision)
+            or (str(quality).strip().lower() in {"high", "xhigh", "max"})
+            or any(k in explicit_model_clean.lower() for k in ("sunburst", "pro", "dall-e-3", "plus", "ultra"))
+        )
         model_name, final_quality, req_timeout, perm_notice = (
-            self._resolve_model_and_quality(event, want_high)
+            self._resolve_model_and_quality(event, want_high, explicit_model=explicit_model_clean)
         )
         if perm_notice == "REJECT_NON_ADMIN":
             return "权限不足：高级/高精度旗舰生图模型仅限机器人管理员调用，普通生图请直接描述画面。"
+
+        if quality and quality.strip().lower() in {"low", "medium", "high", "xhigh", "max", "auto"}:
+            q_clean = quality.strip().lower()
+            if q_clean in {"high", "xhigh", "max"}:
+                if self._is_sender_admin(event):
+                    final_quality = q_clean
+            else:
+                final_quality = q_clean
 
         default_size = (
             str(self.config.get("default_size", "1024x1024") or "").strip()
@@ -1464,13 +1592,42 @@ class MinimalVisionDrawPlugin(star.Star):
             or event.message_str.strip()
             or "high quality creative illustration"
         )
+
+        # 解析背景与透明度模式 (transparent / opaque / auto)
+        bg_param = str(background or "auto").strip().lower()
+        if bg_param in {"transparent", "opaque", "auto"}:
+            bg = bg_param
+        elif any(k in bg_param for k in ("透", "transparent", "alpha", "幽灵", "抠图", "无底", "无背景")):
+            bg = "transparent"
+        elif any(k in bg_param for k in ("实", "opaque", "实色", "白底", "黑底")):
+            bg = "opaque"
+        else:
+            bg = "auto"
+
+        default_bg = str(self.config.get("default_background", "auto") or "auto").strip().lower()
+        if bg == "auto" and default_bg in {"transparent", "opaque"}:
+            bg = default_bg
+
+        # 智能语义双重保护：若提示词包含透明/幽灵图意图且未强制指定 opaque，自动启用 transparent
+        trans_keywords = (
+            "透明底", "透明背景", "透明图", "幽灵图", "透明通道", "透明png",
+            "透明", "抠图", "贴纸", "表情包", "无底", "无背景",
+            "transparent", "alpha channel", "alpha", "cutout", "isolated"
+        )
+        if bg == "auto" and any(k in final_prompt.lower() for k in trans_keywords):
+            bg = "transparent"
+
         fmt = str(output_format or "png").strip().lower().lstrip(".")
-        if fmt not in {"png", "jpeg", "webp", "gif"}:
+        if fmt not in {"png", "jpeg", "webp", "gif", "svg"}:
             fmt = "gif" if "gif" in fmt or "动图" in fmt else "png"
 
         # 若显式传入了动图参数，自动确定为 GIF
         if (frame_count and frame_count > 0) or (fps and fps > 0) or (frame_duration_ms and frame_duration_ms > 0):
             fmt = "gif"
+
+        # 若指定了透明背景，输出格式强制为支持 Alpha 通道的 png 或 webp (严禁转为 jpeg)
+        if bg == "transparent" and fmt in {"jpeg", "jpg"}:
+            fmt = "png"
 
         if fmt == "gif":
             final_size = "auto"
@@ -1481,6 +1638,12 @@ class MinimalVisionDrawPlugin(star.Star):
         client = AsyncOpenAI(api_key=api_key, base_url=api_base, timeout=req_timeout)
 
         extra_kwargs: dict[str, Any] = {"output_format": fmt}
+        if bg in {"transparent", "opaque", "auto"}:
+            extra_kwargs["background"] = bg
+
+        if complexity and complexity.lower() in {"low", "medium", "high"}:
+            extra_kwargs["complexity"] = complexity.lower()
+
         final_fc: int = 0
         final_dur: int = 0
         if fmt == "gif":
@@ -1501,6 +1664,21 @@ class MinimalVisionDrawPlugin(star.Star):
 
             extra_kwargs["frame_count"] = final_fc
             extra_kwargs["frame_duration_ms"] = final_dur
+
+        async def _call_api_with_fallback(call_fn, **kwargs):
+            try:
+                return await call_fn(**kwargs)
+            except Exception as err:
+                err_msg = str(err).lower()
+                removed = False
+                for p in ("complexity", "background"):
+                    if p in kwargs and (p in err_msg or "unexpected keyword" in err_msg or "unrecognized" in err_msg or "extra" in err_msg or "400" in err_msg):
+                        kwargs.pop(p, None)
+                        removed = True
+                if removed:
+                    self._log.warning(f"[MinimalDraw] 上游生图接口不支持扩展参数 ({err})，自动降级核心参数重试")
+                    return await call_fn(**kwargs)
+                raise err
 
         try:
             if ref_paths:
@@ -1525,7 +1703,8 @@ class MinimalVisionDrawPlugin(star.Star):
                         f"[MinimalDraw] 正在调用 {model_name} 执行{mode_desc}: prompt={final_prompt[:60]!r}, format={fmt}, size={final_size}, quality={final_quality}"
                     )
                     try:
-                        resp = await client.images.edit(
+                        resp = await _call_api_with_fallback(
+                            client.images.edit,
                             model=model_name,
                             image=upload_files
                             if len(upload_files) > 1
@@ -1545,7 +1724,8 @@ class MinimalVisionDrawPlugin(star.Star):
                                 ref_paths[:6], max_canvas_edge=max_ref_edge
                             )
                             if stitched_png:
-                                resp = await client.images.edit(
+                                resp = await _call_api_with_fallback(
+                                    client.images.edit,
                                     model=model_name,
                                     image=("stitched_grid.png", stitched_png, "image/png"),
                                     prompt=final_prompt,
@@ -1559,7 +1739,8 @@ class MinimalVisionDrawPlugin(star.Star):
                             raise edit_err
                 else:
                     mode_desc = "文生图(参考图读取失败自动降级)"
-                    resp = await client.images.generate(
+                    resp = await _call_api_with_fallback(
+                        client.images.generate,
                         model=model_name,
                         prompt=final_prompt,
                         size=final_size,  # type: ignore[arg-type]
@@ -1576,7 +1757,8 @@ class MinimalVisionDrawPlugin(star.Star):
                 self._log.info(
                     f"[MinimalDraw] 正在调用 {model_name} 执行{mode_desc}: prompt={final_prompt[:60]!r}, format={fmt}, size={final_size}, quality={final_quality}"
                 )
-                resp = await client.images.generate(
+                resp = await _call_api_with_fallback(
+                    client.images.generate,
                     model=model_name,
                     prompt=final_prompt,
                     size=final_size,  # type: ignore[arg-type]
@@ -1588,7 +1770,16 @@ class MinimalVisionDrawPlugin(star.Star):
                 return "生图接口未返回任何图像数据。"
 
             first_img = resp.data[0]
-            file_ext = "gif" if fmt == "gif" else "png"
+            if fmt == "gif":
+                file_ext = "gif"
+            elif fmt == "webp":
+                file_ext = "webp"
+            elif fmt in ("jpeg", "jpg"):
+                file_ext = "jpg"
+            elif fmt == "svg":
+                file_ext = "svg"
+            else:
+                file_ext = "png"
             out_path = self._cache_dir / f"gen_{uuid.uuid4().hex[:10]}.{file_ext}"
 
             if getattr(first_img, "b64_json", None):
@@ -1611,19 +1802,39 @@ class MinimalVisionDrawPlugin(star.Star):
                 is_bot_generated=True,
             )
 
-            await event.send(
-                MessageChain(chain=[Comp.Image.fromFileSystem(str(out_path))])
-            )
+            send_path = self._prepare_send_image_path(out_path, fmt)
+
+            try:
+                await event.send(
+                    MessageChain(chain=[Comp.Image.fromFileSystem(str(send_path))])
+                )
+            except Exception as send_err:
+                err_text = str(send_err)
+                # 若因 NTQQ 上传大文件或网络波动导致 NapCat 返回 1200 NTEvent sendMsg 超时，
+                # 但实际上 NTQQ 内核已经在后台排队上传并发送了，此时不应作为生图失败打断并道歉
+                if "1200" in err_text or "Timeout" in err_text or "NTEvent" in err_text:
+                    self._log.warning(
+                        f"[MinimalDraw] QQ 发送大图触发 NTQQ 异步确认超时 (retcode=1200)，"
+                        f"但内核后台已在排队上传并发送: {send_err}"
+                    )
+                else:
+                    raise send_err
 
             gif_detail = (
                 f"，{final_fc}帧/{final_dur}ms/约{round(1000.0 / final_dur, 1)}fps/总长{round(final_fc * final_dur / 1000.0, 1)}s"
                 if fmt == "gif"
                 else ""
             )
+            bg_desc = ""
+            if bg == "transparent":
+                bg_desc = "，背景: TRANSPARENT(透明底/原生Alpha通道/幽灵图)"
+            elif bg == "opaque":
+                bg_desc = "，背景: OPAQUE(实色)"
+
             notice_str = f" | {perm_notice}" if perm_notice else ""
             return (
-                f"图片已生成并发送（模式: {mode_desc}，格式: {fmt.upper()}{gif_detail}，模型: {model_name}，画质: {final_quality}"
-                f"{notice_str}，编号: #{cached_item.image_id}）。"
+                f"图片已生成并发送（模式: {mode_desc}，格式: {fmt.upper()}{gif_detail}{bg_desc}，模型: {model_name}，画质: {final_quality}"
+                f"{notice_str}，编号: #{cached_item.image_id}）。【已发送完成】图片已成功投递至群聊，任务已全部完成，请勿在同一轮回复中再次调用 draw_image。"
             )
         except Exception as e:
             self._log.error(f"[MinimalDraw] 生图失败: {e}", exc_info=True)
