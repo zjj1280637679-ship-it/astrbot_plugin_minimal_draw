@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.5.0] - 2026-11-13
+
+### Changed & Refactored
+- **全量对齐 OpenAI 官方 GPT-Image-2.6 / Responses API 标准工具调用规范 (`draw_image`)**：
+  - **客观标准结构重塑**：遵循“只给客观条件描述与最小例子，不剥夺消极自由”原则，彻底对齐官方 Function Calling 字段与类型定义。
+  - **新增 `action` 动作类型控制**：新增 `action` 参数（枚举值：`"auto"`, `"generate"`, `"edit"`），支持大模型显式声明文生图（`generate`，忽略历史上下文图片干扰）与参考图编辑抠图（`edit`）。
+  - **释放动图与静态图全量长宽比控制 (`size`)**：彻底移除对 GIF 动图强制写死 `auto` 的内部限制，现在静态图与动图均完整支持 `1024x1024`（1:1 方图）、`1536x1024`（3:2/16:9 宽屏横图）、`1024x1536`（2:3/9:16 竖屏长图）及 `auto`；并新增接口像素预算超标时自动回退为 `auto` 的降级兜底。
+  - **底层 JSON Schema 智能增强 (`_enhance_tool_schemas`)**：在生命周期初始化中，向 AstrBot 工具管理器注入标准 JSON Schema（包含 `required: ["prompt"]`、严格 `enum` 枚举限定、`minimum`/`maximum` 数值约束与 `default` 默认值），杜绝大模型在调用工具时因缺乏 Schema 选项而盲目猜想或参数残缺。
+  - **规范化各工具契约注释**：同步规范 `view_recent_images`、`forward_images` 与 `draw_image` 的 docstring 与参数格式。
+
 ## [1.4.0] - 2026-11-12
 
 ### Added

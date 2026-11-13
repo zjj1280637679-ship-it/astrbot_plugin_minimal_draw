@@ -116,10 +116,86 @@ class MinimalVisionDrawPlugin(star.Star):
                 headers={"User-Agent": "Mozilla/5.0 (AstrBot MinimalDrawPlugin/1.2)"},
             )
         self._prune_disk_cache()
+        self._enhance_tool_schemas()
         self._log.info(
             f"[MinimalDraw] 插件已初始化，数据目录: {self._data_dir}，"
             f"已恢复 {len(self._session_images)} 个活跃会话的图片池（全局共 {len(self._global_images)} 张）。"
         )
+
+    def _enhance_tool_schemas(self) -> None:
+        """为注册的工具注入官方标准 JSON Schema（枚举选项、约束与必填项）"""
+        try:
+            mgr = self.context.get_llm_tool_manager()
+            if not mgr:
+                return
+            draw_tool = mgr.get_func("draw_image")
+            if draw_tool and draw_tool.parameters and "properties" in draw_tool.parameters:
+                props = draw_tool.parameters["properties"]
+                if "action" in props:
+                    props["action"]["enum"] = ["auto", "generate", "edit"]
+                    props["action"]["default"] = "auto"
+                if "model" in props:
+                    props["model"]["enum"] = [
+                        "gpt-image-2.6-sunburst",
+                        "gpt-image-2.6-flare",
+                        "dall-e-3",
+                        "dall-e-2",
+                    ]
+                if "size" in props:
+                    props["size"]["enum"] = [
+                        "auto",
+                        "1024x1024",
+                        "1536x1024",
+                        "1024x1536",
+                        "1:1",
+                        "16:9",
+                        "9:16",
+                        "3:2",
+                        "2:3",
+                        "4:3",
+                        "3:4",
+                    ]
+                    props["size"]["default"] = "auto"
+                if "background" in props:
+                    props["background"]["enum"] = ["auto", "transparent", "opaque"]
+                    props["background"]["default"] = "auto"
+                if "output_format" in props:
+                    props["output_format"]["enum"] = ["png", "webp", "jpeg", "gif", "svg"]
+                    props["output_format"]["default"] = "png"
+                if "quality" in props:
+                    props["quality"]["enum"] = ["auto", "low", "medium", "high", "xhigh", "max"]
+                    props["quality"]["default"] = "auto"
+                if "complexity" in props:
+                    props["complexity"]["enum"] = ["auto", "low", "medium", "high"]
+                    props["complexity"]["default"] = "auto"
+                if "frame_count" in props:
+                    props["frame_count"]["minimum"] = 2
+                    props["frame_count"]["maximum"] = 16
+                    props["frame_count"]["default"] = 9
+                if "frame_duration_ms" in props:
+                    props["frame_duration_ms"]["minimum"] = 20
+                    props["frame_duration_ms"]["maximum"] = 2000
+                    props["frame_duration_ms"]["default"] = 180
+                draw_tool.parameters["required"] = ["prompt"]
+
+            fwd_tool = mgr.get_func("forward_images")
+            if fwd_tool and fwd_tool.parameters and "properties" in fwd_tool.parameters:
+                f_props = fwd_tool.parameters["properties"]
+                if "forward_mode" in f_props:
+                    f_props["forward_mode"]["enum"] = ["auto", "direct", "merged"]
+                    f_props["forward_mode"]["default"] = "auto"
+                if "target" in f_props:
+                    f_props["target"]["default"] = "current"
+
+            view_tool = mgr.get_func("view_recent_images")
+            if view_tool and view_tool.parameters and "properties" in view_tool.parameters:
+                v_props = view_tool.parameters["properties"]
+                if "count" in v_props:
+                    v_props["count"]["minimum"] = 1
+                    v_props["count"]["maximum"] = 20
+                    v_props["count"]["default"] = 5
+        except Exception as e:
+            self._log.warning(f"[MinimalDraw] 增强工具 JSON Schema 失败: {e}")
 
     async def terminate(self) -> None:
         """插件卸载/禁用/重载生命周期钩子：保存索引并释放网络资源"""
@@ -942,7 +1018,7 @@ class MinimalVisionDrawPlugin(star.Star):
         - view_recent_images(count=10)：调取最近 10 张图片
 
         Args:
-            count(number): 调取近期图片数量 N，默认 5（理论支持 1~20 范围自由调整）
+            count(number): 调取近期图片数量 N，默认 5（有效范围 1~20）。
         """
         umo = event.unified_msg_origin
         try:
@@ -1486,9 +1562,9 @@ class MinimalVisionDrawPlugin(star.Star):
             return s
         if s in {"square", "1:1", "方图", "正方形"}:
             return "1024x1024"
-        if s in {"portrait", "vertical", "2:3", "9:16", "竖图", "竖屏"}:
+        if s in {"portrait", "vertical", "2:3", "9:16", "3:4", "1:2", "竖图", "竖屏"}:
             return "1024x1536"
-        if s in {"landscape", "horizontal", "3:2", "16:9", "横图", "横屏"}:
+        if s in {"landscape", "horizontal", "3:2", "16:9", "4:3", "2:1", "21:9", "横图", "横屏"}:
             return "1536x1024"
         return default_size
 
@@ -1498,51 +1574,44 @@ class MinimalVisionDrawPlugin(star.Star):
         event: AstrMessageEvent,
         prompt: str = "",
         model: str = "",
-        image_source: str = "",
-        output_format: str = "png",
-        background: str = "auto",
+        action: str = "auto",
         size: str = "",
-        high_precision: bool = False,
+        background: str = "auto",
+        output_format: str = "png",
         quality: str = "",
         complexity: str = "auto",
+        image_source: str = "",
+        high_precision: bool = False,
         frame_count: int = 0,
         fps: float = 0.0,
         frame_duration_ms: int = 0,
     ) -> str:
-        """【工具是什么】：OpenAI 旗舰图像模型生图、智能抠图、多图融合、幽灵图与原生 GIF 动图生成工具。
-        【功能】：文生静态图/动图、透明底幽灵图、免抠贴纸，或基于任意单张/多张参考图进行修改、风格转换、抠图去底、动图化与多图融合。生成的图片或动图直接发送至当前会话并存入图片池。
+        """【工具是什么】：OpenAI 旗舰图像与动图模型标准工具（文生图、图生图编辑、幽灵图/透明贴纸与原生 GIF 动图生成）。
+        【功能】：文本描述直接生图、基于单张/多张参考图进行风格修改、抠图去底去背景、动图化及多图特征融合。生成的图片或动图直接发送至当前会话并存入图片池。
         【返回状态】：生成模式、输出格式（动图附带帧数/单帧时长/帧率/总时长）、背景模式（透明底/实底）、使用模型、画质档位及图片编号（#IMG_n）。
-        【客观参数范围与换算】：
-        - 模型选择 model：显式指定生图模型ID（如 "gpt-image-2.6-sunburst"、"gpt-image-2.6-flare"、"dall-e-3"）。管理员可在对话中根据需求自由指定任意模型；留空则根据 high_precision 自动选取。
-        - 背景模式 background：
-          * transparent：【透明背景 / 幽灵图 / 抠图贴纸 / 原生Alpha通道】。去除画面背景，输出带原生 Alpha 透明通道的 PNG/WebP（在 QQ 中呈现浮空幽灵图/透明贴纸表情包）。用户要求“透明底”、“透明背景”、“幽灵图”、“抠图”、“贴纸”、“表情包”、“无背景”、“透明通道”时必须使用此参数。
-          * opaque：【实色背景】。强制生成带有完整环境或实色背景的图像。
-          * auto：【自动模式，默认】。由模型根据画面描述自主决定是否有背景。
-        - 帧数 frame_count：理论有效区间 2~16 帧（API 物理上限 16 帧，默认 9 帧）。
-        - 单帧时长 frame_duration_ms：理论有效区间 20~2000 ms（对应 0.5~50 fps，默认 180ms）。
-        - 物理换算公式：frame_duration_ms = round(1000 / fps)，动图总时长(秒) = frame_count * (frame_duration_ms / 1000) = frame_count / fps。
         【最小例子】：
         - draw_image(prompt="可爱的幽灵猫咪表情包", background="transparent")：纯透明底幽灵图/贴纸 (原生透明通道)
         - draw_image(prompt="把这张图的主体抠出来做成透明底贴纸", image_source="latest", background="transparent")：图生图智能抠图去底
         - draw_image(prompt="水彩风风景画")：基础文生图
         - draw_image(prompt="用sunburst画一张未来赛博朋克城市", model="gpt-image-2.6-sunburst")：指定模型ID生图
         - draw_image(prompt="融合两图特征", image_source="IMG_1,IMG_2")：多图融合
-        - draw_image(prompt="日落分镜叙事", output_format="gif", frame_count=16, fps=1)：慢速叙事动图（16帧/1fps/16秒故事流）
-        - draw_image(prompt="日常动作表情包", output_format="gif", background="transparent", frame_count=8, fps=8)：透明底动态表情包
+        - draw_image(prompt="日落分镜叙事", output_format="gif", size="16:9", frame_count=16, fps=1)：宽屏慢速叙事动图（16帧/1fps/16秒故事流）
+        - draw_image(prompt="日常动作表情包", output_format="gif", size="1:1", background="transparent", frame_count=8, fps=8)：1:1透明底动态表情包
 
         Args:
-            prompt(string): 画面描述或修改/融合/抠图指令（如 "一只穿宇航服的橘猫"、"可爱的幽灵柴犬透明贴纸" 或 "把图1与图2融合"）
-            model(string): 显式指定使用的生图模型 ID（如 "gpt-image-2.6-sunburst"、"gpt-image-2.6-flare"、"dall-e-3"）。管理员可在对话中自由指定任意模型；留空则根据 high_precision 自动匹配
-            image_source(string): 参考图来源（支持逗号或加号组合多图融合）。留空("")自动提取当前或引用消息中的全部图片；可填 "IMG_1"、"1-3"、"latest"、"forward"（合并转发图）、"my_latest"、"self_avatar"、"at_avatar"、"avatar:QQ号"、"group_avatar" 或网络 URL/本地路径；强制纯文生图填 "none"
-            output_format(string): 输出格式。默认 "png"（静态图推荐，完整保留透明通道）；也支持 "webp"（轻量透明图）、"jpeg"（仅限纯实底图）、"gif"（动图）、"svg"（矢量图）。注意：当 background="transparent" 时，格式必须为 png 或 webp，严禁使用 jpeg
-            background(string): 画面背景模式与透明通道控制。可选 'transparent' (透明底/幽灵图/抠图贴纸/原生Alpha通道)、'opaque' (实色背景)、'auto' (自动判断，默认)。当用户提及透明底、透明图、幽灵图、抠图、贴纸、表情包、无背景或透明通道时必须设为 'transparent'
-            size(string): 画面尺寸或比例。留空自动匹配（静态图默认 1024x1024，GIF 动图自动使用 auto），静态图可填 "1024x1024"、"1024x1536"、"1536x1024"、"1:1"、"16:9"、"9:16"、"3:2"、"4:3"
-            high_precision(boolean): 是否请求高级/高精度精绘模型。默认 false，true 则请求高级旗舰模型 (如 gpt-image-2.6-sunburst)
-            quality(string): 画质档位。可选 'low', 'medium', 'high', 'xhigh', 'max', 'auto'。留空根据 high_precision 自动决定
-            complexity(string): 画面思考与规划复杂度。可选 'low' (快速迭代/抠图去底/轻量修改)、'medium'、'high' (复杂构图/高难文字排版)、'auto' (默认)
-            frame_count(number): GIF 总帧数。有效范围 2~16 帧（API 上限 16 帧）。留空或填 0 时使用默认值（9 帧）
-            fps(number): GIF 播放帧率（每秒播放帧数，范围 0.5~50 fps）。自动换算单帧时长 round(1000 / fps)。若与 frame_duration_ms 同时提供，优先使用 frame_duration_ms。留空或填 0 时使用默认帧率（约 5.5 fps）
-            frame_duration_ms(number): GIF 单帧停留时长（毫秒，有效范围 20~2000 ms）。与 fps 二选一。留空或填 0 时使用默认值（180ms）
+            prompt(string): 画面描述、主体动作或修改指令（如 "一只戴墨镜的猫咪"、"把背景换成雪山"）
+            model(string): 显式指定调用的生图模型 ID。可选值：'gpt-image-2.6-sunburst' (旗舰精绘与一致性编辑)、'gpt-image-2.6-flare' (低延迟快速生成)、'dall-e-3' 等。留空则根据画质与管理员身份自动路由
+            action(string): 图像生成动作类型。可选值：'generate' (纯文生图，忽略历史参考图)、'edit' (基于参考图编辑/局部修改/抠图去底)、'auto' (自动判断，默认)
+            size(string): 画面尺寸或宽高比。静态图与 GIF 动图均完全支持。可选值：'auto' (自适应，默认)、'1024x1024' (1:1 方图)、'1536x1024' (3:2/16:9 横图)、'1024x1536' (2:3/9:16 竖图)
+            background(string): 背景透明度模式与 Alpha 通道控制。可选值：'auto' (自动判断，默认)、'transparent' (生成原生 Alpha 透明底/免抠贴纸/幽灵图/透明表情包)、'opaque' (实色背景)。当用户提及透明底、幽灵图、抠图贴纸、透明通道时设为 'transparent'
+            output_format(string): 输出图像文件格式。可选值：'png' (推荐，完整保留透明通道)、'webp' (轻量透明图)、'jpeg' (仅限实色图)、'gif' (原生循环动图)、'svg' (矢量图)。注意：当 background='transparent' 时格式必须为 'png' 或 'webp'
+            quality(string): 渲染画质档位。可选值：'auto' (默认)、'low' (草图快绘)、'medium' (标准)、'high' (精绘)、'xhigh' (超精绘)、'max' (极限画质)
+            complexity(string): 构图与前置规划思考复杂度。可选值：'auto' (默认)、'low' (快速迭代/轻量修改)、'medium'、'high' (复杂多角色/高难文字排版)
+            image_source(string): 参考图来源。可选值：'latest' (最新一张)、'IMG_1' 等编号、'1-3'、'forward' (合并转发聊天记录图)、'self_avatar'、'at_avatar'、'none' (强制纯文生图) 或网络图片 URL。留空且 action!='generate' 时自动嗅探引用或近期图片
+            high_precision(boolean): 是否请求高级/高精度旗舰模型（默认 false）。设置为 true 或 quality='high' 时将调用高精度旗舰模型
+            frame_count(number): 原生 GIF 动图总帧数（有效物理范围 2~16 帧，默认 9 帧）。仅在 output_format='gif' 时生效
+            fps(number): 原生 GIF 动图播放帧率（每秒播放帧数，范围 0.5~50 fps）。自动换算单帧时长 round(1000/fps)。与 frame_duration_ms 二选一
+            frame_duration_ms(number): 原生 GIF 动图单帧停留毫秒数（范围 20~2000 ms，默认 180ms）。仅在 output_format='gif' 时生效
         """
         umo = event.unified_msg_origin
         is_adm = self._is_sender_admin(event)
@@ -1629,12 +1698,24 @@ class MinimalVisionDrawPlugin(star.Star):
         if bg == "transparent" and fmt in {"jpeg", "jpg"}:
             fmt = "png"
 
+        # 动图与静态图尺寸统一通过 _normalize_size 进行规范化解析（GIF 留空时默认 auto）
         if fmt == "gif":
-            final_size = "auto"
+            final_size = self._normalize_size(size, "auto") if size else "auto"
         else:
             final_size = self._normalize_size(size, default_size)
 
-        ref_paths = await self._resolve_image_sources(event, image_source)
+        # 解析动作意图 (generate: 纯文生图; edit: 基于参考图编辑/抠图; auto: 自动判断)
+        act = str(action or "auto").strip().lower()
+        if act not in {"generate", "edit", "auto"}:
+            act = "auto"
+
+        effective_image_source = image_source
+        if act == "generate" and not image_source:
+            effective_image_source = "none"
+        elif act == "edit" and not image_source:
+            effective_image_source = "latest"
+
+        ref_paths = await self._resolve_image_sources(event, effective_image_source)
         client = AsyncOpenAI(api_key=api_key, base_url=api_base, timeout=req_timeout)
 
         extra_kwargs: dict[str, Any] = {"output_format": fmt}
@@ -1672,9 +1753,19 @@ class MinimalVisionDrawPlugin(star.Star):
                 err_msg = str(err).lower()
                 removed = False
                 for p in ("complexity", "background"):
-                    if p in kwargs and (p in err_msg or "unexpected keyword" in err_msg or "unrecognized" in err_msg or "extra" in err_msg or "400" in err_msg):
+                    if p in kwargs and (
+                        p in err_msg
+                        or "unexpected keyword" in err_msg
+                        or "unrecognized" in err_msg
+                        or "extra" in err_msg
+                        or "400" in err_msg
+                    ):
                         kwargs.pop(p, None)
                         removed = True
+                # 若特定尺寸在 GIF 或模型中不被支持（如 pixel budget 超标或 invalid size），自动降级为 auto 重试
+                if "size" in kwargs and kwargs["size"] != "auto" and any(k in err_msg for k in ("size", "dimension", "budget", "resolution")):
+                    kwargs["size"] = "auto"
+                    removed = True
                 if removed:
                     self._log.warning(f"[MinimalDraw] 上游生图接口不支持扩展参数 ({err})，自动降级核心参数重试")
                     return await call_fn(**kwargs)
